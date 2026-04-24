@@ -1,5 +1,9 @@
 // RUN: mlir-opt %s --test-vector-gather-lowering | FileCheck %s
 // RUN: mlir-opt %s --test-vector-gather-lowering --canonicalize | FileCheck %s --check-prefix=CANON
+// RUN: mlir-opt %s --test-vector-gather-lowering=assume-in-bounds-offsets \
+// RUN:   | FileCheck %s --check-prefix=INBOUNDS
+// RUN: mlir-opt %s --test-vector-gather-lowering=assume-in-bounds-offsets --canonicalize \
+// RUN:   | FileCheck %s --check-prefix=INBOUNDS-CANON
 
 // CHECK-LABEL: @gather_memref_1d
 // CHECK-SAME:    ([[BASE:%.+]]: memref<?xf32>, [[IDXVEC:%.+]]: vector<2xindex>, [[MASK:%.+]]: vector<2xi1>, [[PASS:%.+]]: vector<2xf32>)
@@ -54,11 +58,11 @@ func.func @gather_memref_1d_i32_index(%base: memref<?xf32>, %v: vector<2xi32>, %
 // CHECK-DAG:     %[[C0:.+]]    = arith.constant 0 : index
 // CHECK-DAG:     %[[C1:.+]]    = arith.constant 1 : index
 // CHECK-DAG:     [[PTV0:%.+]]  = vector.extract [[PASS]][0] : vector<3xf32> from vector<2x3xf32>
-// CHECK:         %[[LIN:.+]]   = affine.linearize_index [%[[C0]], %[[C1]]] by
 // CHECK-DAG:     [[M0:%.+]]    = vector.extract [[MASK]][0, 0] : i1 from vector<2x3xi1>
 // CHECK-DAG:     [[IDX0:%.+]]  = vector.extract [[IDXVEC]][0, 0] : index from vector<2x3xindex>
-// CHECK:         %[[FLAT0:.+]] = arith.addi %[[LIN]], [[IDX0]] : index
-// CHECK:         %[[DL0:.+]]:2 = affine.delinearize_index %[[FLAT0]] into
+// CHECK:         %[[ADD0:.+]]  = arith.addi [[IDX0]], %[[C1]] : index
+// CHECK:         %[[LIN:.+]]   = affine.linearize_index [%[[C0]], %[[ADD0]]] by
+// CHECK:         %[[DL0:.+]]:2 = affine.delinearize_index %[[LIN]] into
 // CHECK:         [[RES0:%.+]]  = scf.if [[M0]] -> (vector<3xf32>)
 // CHECK-NEXT:      [[LD0:%.+]]   = vector.load [[BASE]][%[[DL0]]#0, %[[DL0]]#1] : memref<?x?xf32>, vector<1xf32>
 // CHECK-NEXT:      [[ELEM0:%.+]] = vector.extract [[LD0]][0] : f32 from vector<1xf32>
@@ -293,7 +297,9 @@ func.func @scalable_gather_1d(%base: tensor<?xf32>, %v: vector<[2]xindex>, %mask
 }
 
 // Verify that gather on a 2D memref delinearizes the gather index.
-// With zero base offsets, the linearize and addi fold away.
+// With zero base offsets, the inner `addi(0, idx)` folds to `idx` and the
+// resulting linearize has a leading-zero entry that drops under
+// `--canonicalize`, leaving a single `affine.delinearize_index` per lane.
 
 // CHECK-LABEL: @gather_memref_2d_delinearize
 // CHECK-SAME:    (%[[BASE:.+]]: memref<4x2xf32>,
@@ -303,24 +309,17 @@ func.func @scalable_gather_1d(%base: tensor<?xf32>, %v: vector<[2]xindex>, %mask
 // CHECK-DAG:     %[[IDXS:.+]] = arith.index_cast %[[IDXVEC]]
 //
 // CHECK-DAG:     %[[IDX0:.+]] = vector.extract %[[IDXS]][0]
-// CHECK:         %[[DL0:.+]]:2 = affine.delinearize_index %[[IDX0]] into (4, 2)
+// CHECK:         %[[LIN0:.+]] = affine.linearize_index [%{{.+}}, %[[IDX0]]] by (4, 2)
+// CHECK:         %[[DL0:.+]]:2 = affine.delinearize_index %[[LIN0]] into (4, 2)
 // CHECK:         scf.if
 // CHECK:           vector.load %[[BASE]][%[[DL0]]#0, %[[DL0]]#1] : memref<4x2xf32>, vector<1xf32>
-//
-// CHECK:         %[[IDX1:.+]] = vector.extract %[[IDXS]][1]
-// CHECK:         affine.delinearize_index %[[IDX1]] into (4, 2)
-// CHECK:         scf.if
-// CHECK:           vector.load %[[BASE]][%{{.+}}, %{{.+}}] : memref<4x2xf32>, vector<1xf32>
-//
-// CHECK:         %[[IDX2:.+]] = vector.extract %[[IDXS]][2]
-// CHECK:         affine.delinearize_index %[[IDX2]] into (4, 2)
-// CHECK:         scf.if
-// CHECK:           vector.load %[[BASE]][%{{.+}}, %{{.+}}] : memref<4x2xf32>, vector<1xf32>
-//
-// CHECK:         %[[IDX3:.+]] = vector.extract %[[IDXS]][3]
-// CHECK:         affine.delinearize_index %[[IDX3]] into (4, 2)
-// CHECK:         scf.if
-// CHECK:           vector.load %[[BASE]][%{{.+}}, %{{.+}}] : memref<4x2xf32>, vector<1xf32>
+
+// CANON-LABEL: @gather_memref_2d_delinearize
+// CANON-NOT:   affine.linearize_index
+// CANON:       %[[IDX0:.+]] = vector.extract %{{.+}}[0] : index from vector<4xindex>
+// CANON:       %[[DL0:.+]]:2 = affine.delinearize_index %[[IDX0]] into (4, 2)
+// CANON:       scf.if
+// CANON:         vector.load %{{.+}}[%[[DL0]]#0, %[[DL0]]#1] : memref<4x2xf32>, vector<1xf32>
 func.func @gather_memref_2d_delinearize(
     %base: memref<4x2xf32>,
     %v: vector<4xi32>, %mask: vector<4xi1>,
@@ -334,8 +333,10 @@ func.func @gather_memref_2d_delinearize(
 
 // -----
 
-// Verify that gather on a 2D memref with non-zero base offsets correctly
-// incorporates the offsets via linearize + add + delinearize.
+// Verify that gather on a 2D memref with non-zero base offsets fuses the
+// gather index into the innermost offset and round-trips through
+// linearize/delinearize so that any cross-dim carry is expressed in the
+// load indices.
 
 // CHECK-LABEL: @gather_memref_2d_delinearize_nonzero_offsets
 // CHECK-SAME:    (%[[BASE:.+]]: memref<4x2xf32>,
@@ -344,10 +345,10 @@ func.func @gather_memref_2d_delinearize(
 // CHECK-SAME:     %[[MASK:.+]]: vector<2xi1>,
 // CHECK-SAME:     %[[PASS:.+]]: vector<2xf32>)
 // CHECK-DAG:     %[[IDXS:.+]] = arith.index_cast %[[IDXVEC]]
-// CHECK:         %[[LIN:.+]] = affine.linearize_index [%[[OFF0]], %[[OFF1]]] by (4, 2)
 // CHECK:         %[[IDX0:.+]] = vector.extract %[[IDXS]][0]
-// CHECK:         %[[FLAT:.+]] = arith.addi %[[LIN]], %[[IDX0]]
-// CHECK:         %[[DL:.+]]:2 = affine.delinearize_index %[[FLAT]] into (4, 2)
+// CHECK:         %[[ADD:.+]] = arith.addi %[[OFF1]], %[[IDX0]]
+// CHECK:         %[[LIN:.+]] = affine.linearize_index [%[[OFF0]], %[[ADD]]] by (4, 2)
+// CHECK:         %[[DL:.+]]:2 = affine.delinearize_index %[[LIN]] into (4, 2)
 // CHECK:         scf.if
 // CHECK:           vector.load %[[BASE]][%[[DL]]#0, %[[DL]]#1]
 func.func @gather_memref_2d_delinearize_nonzero_offsets(
@@ -359,4 +360,77 @@ func.func @gather_memref_2d_delinearize_nonzero_offsets(
     : memref<4x2xf32>, vector<2xi32>,
       vector<2xi1>, vector<2xf32> into vector<2xf32>
   return %0 : vector<2xf32>
+}
+
+// -----
+
+// Verify that with `assume-in-bounds-offsets`, the lowering fuses the gather
+// index into the innermost offset before linearization and marks the
+// `affine.linearize_index` `disjoint`. This makes the linearize/delinearize
+// round-trip cancellable by canonicalization, recovering a single
+// `arith.addi` per lane and a direct n-D `vector.load` (no `floordivsi` /
+// `divsi` / `remsi` arithmetic).
+
+// INBOUNDS-LABEL: @gather_memref_3d_assume_in_bounds
+// INBOUNDS-SAME:    (%[[BASE:.+]]: memref<50x40x40xi8>,
+// INBOUNDS-SAME:     %[[IDXVEC:.+]]: vector<8xindex>,
+// INBOUNDS-SAME:     %[[MASK:.+]]: vector<8xi1>, %[[PASS:.+]]: vector<8xi8>,
+// INBOUNDS-SAME:     %[[I:.+]]: index, %[[J:.+]]: index, %[[K:.+]]: index)
+// INBOUNDS-NOT:    affine.linearize_index{{[ \[]}}
+// INBOUNDS:        %[[IDX0:.+]] = vector.extract %[[IDXVEC]][0]
+// INBOUNDS:        %[[ADD0:.+]] = arith.addi %[[K]], %[[IDX0]] : index
+// INBOUNDS:        %[[LIN0:.+]] = affine.linearize_index disjoint [%[[I]], %[[J]], %[[ADD0]]] by (50, 40, 40)
+// INBOUNDS:        %[[DL0:.+]]:3 = affine.delinearize_index %[[LIN0]] into (50, 40, 40)
+// INBOUNDS:        scf.if
+// INBOUNDS:          vector.load %[[BASE]][%[[DL0]]#0, %[[DL0]]#1, %[[DL0]]#2]
+
+// INBOUNDS-CANON-LABEL: @gather_memref_3d_assume_in_bounds
+// INBOUNDS-CANON-SAME:    (%[[BASE:.+]]: memref<50x40x40xi8>,
+// INBOUNDS-CANON-SAME:     %[[IDXVEC:.+]]: vector<8xindex>,
+// INBOUNDS-CANON-SAME:     %[[MASK:.+]]: vector<8xi1>, %[[PASS:.+]]: vector<8xi8>,
+// INBOUNDS-CANON-SAME:     %[[I:.+]]: index, %[[J:.+]]: index, %[[K:.+]]: index)
+// INBOUNDS-CANON-NOT: affine.linearize_index
+// INBOUNDS-CANON-NOT: affine.delinearize_index
+// INBOUNDS-CANON-NOT: arith.floordivsi
+// INBOUNDS-CANON-NOT: arith.divsi
+// INBOUNDS-CANON-NOT: arith.remsi
+// INBOUNDS-CANON:     %[[IDX0:.+]] = vector.extract %[[IDXVEC]][0]
+// INBOUNDS-CANON:     %[[ADD0:.+]] = arith.addi %[[K]], %[[IDX0]] : index
+// INBOUNDS-CANON:     scf.if
+// INBOUNDS-CANON:       vector.load %[[BASE]][%[[I]], %[[J]], %[[ADD0]]]
+func.func @gather_memref_3d_assume_in_bounds(
+    %base: memref<50x40x40xi8>,
+    %v: vector<8xindex>, %mask: vector<8xi1>, %pass_thru: vector<8xi8>,
+    %i: index, %j: index, %k: index) -> vector<8xi8> {
+  %0 = vector.gather %base[%i, %j, %k][%v], %mask, %pass_thru
+    : memref<50x40x40xi8>, vector<8xindex>,
+      vector<8xi1>, vector<8xi8> into vector<8xi8>
+  return %0 : vector<8xi8>
+}
+
+// -----
+
+// All-zero base offsets: with `assume-in-bounds-offsets`, the inner
+// `arith.addi` and the leading-zero entries of the linearize fold away,
+// leaving the same single `affine.delinearize_index` per lane that the
+// existing zero-offset test already produces.
+
+// INBOUNDS-CANON-LABEL: @gather_memref_2d_assume_in_bounds_zero_offsets
+// INBOUNDS-CANON-SAME:    (%[[BASE:.+]]: memref<4x2xf32>,
+// INBOUNDS-CANON-SAME:     %[[IDXVEC:.+]]: vector<4xi32>,
+// INBOUNDS-CANON-NOT: affine.linearize_index
+// INBOUNDS-CANON:     %[[IDXS:.+]] = arith.index_cast %[[IDXVEC]]
+// INBOUNDS-CANON:     %[[IDX0:.+]] = vector.extract %[[IDXS]][0]
+// INBOUNDS-CANON:     %[[DL0:.+]]:2 = affine.delinearize_index %[[IDX0]] into (4, 2)
+// INBOUNDS-CANON:     scf.if
+// INBOUNDS-CANON:       vector.load %[[BASE]][%[[DL0]]#0, %[[DL0]]#1]
+func.func @gather_memref_2d_assume_in_bounds_zero_offsets(
+    %base: memref<4x2xf32>,
+    %v: vector<4xi32>, %mask: vector<4xi1>,
+    %pass_thru: vector<4xf32>) -> vector<4xf32> {
+  %c0 = arith.constant 0 : index
+  %0 = vector.gather %base[%c0, %c0][%v], %mask, %pass_thru
+    : memref<4x2xf32>, vector<4xi32>,
+      vector<4xi1>, vector<4xf32> into vector<4xf32>
+  return %0 : vector<4xf32>
 }

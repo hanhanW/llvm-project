@@ -259,8 +259,15 @@ void populateVectorGatherLoweringPatterns(RewritePatternSet &patterns,
 /// Turns 1-d `vector.gather` into a scalarized sequence of `vector.loads` or
 /// `tensor.extract`s. To avoid out-of-bounds memory accesses, these
 /// loads/extracts are made conditional using `scf.if` ops.
-void populateVectorGatherToConditionalLoadPatterns(RewritePatternSet &patterns,
-                                                   PatternBenefit benefit = 1);
+///
+/// When `assumeInBoundsOffsets` is set, the caller asserts that for every
+/// active lane the access `base[offsets[0], ..., offsets[k-1] + indices[lane]]`
+/// is within the bounds of `base` (which the `vector.gather` op already
+/// requires for non-UB execution). It allows the patterns to generate more
+/// aggressive IRs that may folds some ops away for performance.
+void populateVectorGatherToConditionalLoadPatterns(
+    RewritePatternSet &patterns, bool assumeInBoundsOffsets = false,
+    PatternBenefit benefit = 1);
 
 /// Populates instances of `MaskOpRewritePattern` to lower masked operations
 /// with `vector.mask`. Patterns should rewrite the `vector.mask` operation and

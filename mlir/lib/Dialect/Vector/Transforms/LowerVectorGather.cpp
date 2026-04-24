@@ -171,8 +171,19 @@ struct RemoveStrideFromGatherSource : OpRewritePattern<vector::GatherOp> {
 ///   idx = indices[i]
 ///   flatIdx = linearize(offsets, memrefShape) + idx
 ///   loadIndices = delinearize(flatIdx, memrefShape)
+///
+/// When `assumeInBoundsOffsets` is set, the caller asserts that
+/// `offsets[k-1] + indices[i]` stays within the innermost dim of the base
+/// (which is what `vector.gather` already requires for non-UB execution).
+/// In that case the addition is fused into the innermost component before
+/// linearization and the linearize is marked `disjoint`, so the round-trip
+/// with delinearize is canceled by canonicalization, leaving a single
+/// `arith.addi` per lane.
 struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
-  using Base::Base;
+  Gather1DToConditionalLoads(MLIRContext *context, bool assumeInBoundsOffsets,
+                             PatternBenefit benefit = 1)
+      : OpRewritePattern<vector::GatherOp>(context, benefit),
+        assumeInBoundsOffsets(assumeInBoundsOffsets) {}
 
   LogicalResult matchAndRewrite(vector::GatherOp op,
                                 PatternRewriter &rewriter) const override {
@@ -215,14 +226,13 @@ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
     auto loadOffsets = llvm::to_vector(op.getOffsets());
     Value lastLoadOffset = loadOffsets.back();
 
-    // Compute the memref shape and linearized offsets once, outside the
-    // per-element loop.
+    // For multi-dimensional memrefs we rebuild loadOffsets per lane: the
+    // innermost component is `offsets[k-1] + idx`, the rest are unchanged.
     SmallVector<OpFoldResult> baseShape;
-    Value linearizedOffsets;
+    SmallVector<Value> savedLoadOffsets;
     if (useDelinearization) {
       baseShape = memref::getMixedSizes(rewriter, loc, base);
-      linearizedOffsets = affine::AffineLinearizeIndexOp::create(
-          rewriter, loc, loadOffsets, baseShape, /*disjoint=*/false);
+      savedLoadOffsets = loadOffsets;
     }
 
     Value result = op.getPassThru();
@@ -237,15 +247,25 @@ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
       Value index = vector::ExtractOp::create(rewriter, loc, indexVec, thisIdx);
 
       if (useDelinearization) {
-        // The gather index offsets the innermost dimension. Combine with
-        // the offsets by linearizing, adding the gather index, then
-        // delinearizing back to N-D indices:
-        //   flatIdx = linearize(offsets, shape) + idx
-        //   loadIndices = delinearize(flatIdx, shape)
-        Value flatIdx =
-            rewriter.createOrFold<arith::AddIOp>(loc, linearizedOffsets, index);
+        // Fuse the gather index into the innermost offset, then round-trip
+        // through linearize/delinearize so that any carry across dims is
+        // expressed in the load indices:
+        //   loadIndices = delinearize(linearize(
+        //       [..., offsets[k-1] + idx], shape), shape)
+        //
+        // When `assumeInBoundsOffsets` is set the caller has asserted
+        // `offsets[k-1] + idx < dim_back` (which `vector.gather` already
+        // requires for non-UB execution); the linearize is then marked
+        // `disjoint` and the round-trip is canceled by canonicalization,
+        // recovering a single `arith.addi` per lane.
+        loadOffsets = savedLoadOffsets;
+        loadOffsets.back() = rewriter.createOrFold<arith::AddIOp>(
+            loc, lastLoadOffset, index);
+        Value linearized = affine::AffineLinearizeIndexOp::create(
+            rewriter, loc, loadOffsets, baseShape,
+            /*disjoint=*/assumeInBoundsOffsets);
         auto delinOp = affine::AffineDelinearizeIndexOp::create(
-            rewriter, loc, flatIdx, baseShape, /*hasOuterBound=*/true);
+            rewriter, loc, linearized, baseShape, /*hasOuterBound=*/true);
         for (int64_t d = 0, rank = loadOffsets.size(); d < rank; ++d)
           loadOffsets[d] = delinOp.getResult(d);
       } else {
@@ -284,6 +304,8 @@ struct Gather1DToConditionalLoads : OpRewritePattern<vector::GatherOp> {
     rewriter.replaceOp(op, result);
     return success();
   }
+
+  bool assumeInBoundsOffsets;
 };
 } // namespace
 
@@ -293,7 +315,9 @@ void mlir::vector::populateVectorGatherLoweringPatterns(
 }
 
 void mlir::vector::populateVectorGatherToConditionalLoadPatterns(
-    RewritePatternSet &patterns, PatternBenefit benefit) {
-  patterns.add<RemoveStrideFromGatherSource, Gather1DToConditionalLoads>(
-      patterns.getContext(), benefit);
+    RewritePatternSet &patterns, bool assumeInBoundsOffsets,
+    PatternBenefit benefit) {
+  patterns.add<RemoveStrideFromGatherSource>(patterns.getContext(), benefit);
+  patterns.add<Gather1DToConditionalLoads>(patterns.getContext(),
+                                           assumeInBoundsOffsets, benefit);
 }

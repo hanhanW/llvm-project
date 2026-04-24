@@ -777,6 +777,10 @@ struct TestVectorGatherLowering
                          OperationPass<func::FuncOp>> {
   MLIR_DEFINE_EXPLICIT_INTERNAL_INLINE_TYPE_ID(TestVectorGatherLowering)
 
+  TestVectorGatherLowering() = default;
+  TestVectorGatherLowering(const TestVectorGatherLowering &pass)
+      : PassWrapper(pass) {}
+
   StringRef getArgument() const final { return "test-vector-gather-lowering"; }
   StringRef getDescription() const final {
     return "Test patterns that lower the gather op in the vector conditional "
@@ -788,10 +792,19 @@ struct TestVectorGatherLowering
                     tensor::TensorDialect, vector::VectorDialect>();
   }
 
+  Option<bool> assumeInBoundsOffsets{
+      *this, "assume-in-bounds-offsets",
+      llvm::cl::desc(
+          "Assert that the gather offsets plus the gather indices are in "
+          "bounds for the base. Enables the linearize/delinearize round-trip "
+          "introduced for n-D memrefs to be folded by canonicalization."),
+      llvm::cl::init(false)};
+
   void runOnOperation() override {
     RewritePatternSet patterns(&getContext());
     populateVectorGatherLoweringPatterns(patterns);
-    populateVectorGatherToConditionalLoadPatterns(patterns);
+    populateVectorGatherToConditionalLoadPatterns(patterns,
+                                                  assumeInBoundsOffsets);
     (void)applyPatternsGreedily(getOperation(), std::move(patterns));
   }
 };
